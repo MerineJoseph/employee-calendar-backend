@@ -32,7 +32,9 @@ public_holidays = store["public_holidays"]
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development only
+    allow_origins=[
+                    "https://employee-calendar-frontend.vercel.app",
+                    "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
