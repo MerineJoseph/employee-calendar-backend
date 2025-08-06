@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # File path for storing persistent data
-DATA_FILE = Path("calendar_data.json")
+DATA_FILE = Path(os.path.dirname(__file__)) / "calendar_data.json"
 
 def load_data():
     if DATA_FILE.exists():
