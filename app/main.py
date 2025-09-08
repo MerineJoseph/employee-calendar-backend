@@ -1,15 +1,20 @@
+# app/main.py
 import os
 import json
-import re
-from pathlib import Path
-
 import httpx
+import re
+import datetime as dt
+from pathlib import Path
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select, delete
+from sqlalchemy.exc import IntegrityError
+from app.db import engine, SessionLocal, Base
+from app.models import CalendarEntry
 
 app = FastAPI()
 
-# ---------- Persistence ----------
+# ---------- Persistence (legacy JSON for one-time import) ----------
 DATA_FILE = Path(__file__).parent / "calendar_data.json"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VALID_STATIONS = {"StationA", "StationB"}
@@ -17,54 +22,7 @@ VALID_STATIONS = {"StationA", "StationB"}
 def normalize_station(station: str) -> str:
     return station if station in VALID_STATIONS else "StationA"
 
-def load_data():
-    if DATA_FILE.exists():
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-            # Backward-compat: wrap legacy flat structure
-            if "stations" not in data:
-                data = {
-                    "stations": {
-                        "StationA": {
-                            "calendar_data": data.get("calendar_data", {}),
-                            "calendar_times": data.get("calendar_times", {}),
-                            "public_holidays": data.get("public_holidays", {}),
-                        },
-                        "StationB": {
-                            "calendar_data": {},
-                            "calendar_times": {},
-                            "public_holidays": {},
-                        },
-                    }
-                }
-            return data
-    # default empty structure
-    return {
-        "stations": {
-            "StationA": {"calendar_data": {}, "calendar_times": {}, "public_holidays": {}},
-            "StationB": {"calendar_data": {}, "calendar_times": {}, "public_holidays": {}},
-        }
-    }
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-store = load_data()
-
-# Helper: ensure station bucket exists and return its dicts
-def get_station_bucket(station: str):
-    stations = store.setdefault("stations", {})
-    if station not in stations:
-        stations[station] = {
-            "calendar_data": {},
-            "calendar_times": {},
-            "public_holidays": {},
-        }
-    bucket = stations[station]
-    return bucket["calendar_data"], bucket["calendar_times"], bucket["public_holidays"]
-
-# ---------- Enable CORS for frontend ----------
+# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -76,15 +34,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Routes ----------
+@app.on_event("startup")
+async def on_startup():
+    # Create tables
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # One-time import of legacy JSON into DB (if table empty and file exists)
+    if DATA_FILE.exists():
+        async with SessionLocal() as session:
+            count = (await session.execute(select(CalendarEntry))).scalars().first()
+            if not count:
+                try:
+                    with open(DATA_FILE, "r") as f:
+                        data = json.load(f)
+
+                    # Back-compat with old shapes (flat or stations)
+                    stations_obj = data.get("stations")
+                    if not stations_obj:
+                        stations_obj = {
+                            "StationA": {
+                                "calendar_data": data.get("calendar_data", {}),
+                                "calendar_times": data.get("calendar_times", {}),
+                                "public_holidays": data.get("public_holidays", {}),
+                            }
+                        }
+
+                    for station, buckets in stations_obj.items():
+                        cal = buckets.get("calendar_data", {})
+                        times = buckets.get("calendar_times", {})
+                        ph   = buckets.get("public_holidays", {})
+                        for d, status in cal.items():
+                            if not DATE_RE.match(d):
+                                continue
+                            is_ph = d in ph
+                            entry = CalendarEntry(
+                                station=normalize_station(station),
+                                date=dt.date.fromisoformat(d),
+                                status=status,
+                                time_label=times.get(d) or ("RD" if status == "Holiday" else "0 hours"),
+                                is_public_holiday=is_ph,
+                                holiday_name=ph.get(d) if is_ph else None,
+                            )
+                            session.add(entry)
+                    await session.commit()
+                    # Optionally delete the JSON file after import:
+                    # DATA_FILE.unlink(missing_ok=True)
+                except Exception:
+                    # If import fails, just continue; DB is empty
+                    pass
+
 @app.get("/")
 def root():
     return {"message": "Backend running"}
 
+# ---------- Helpers ----------
+def _date_or_400(value: str) -> dt.date:
+    if not DATE_RE.match(value):
+        raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
+    return dt.date.fromisoformat(value)
+
+# ---------- Routes ----------
 @app.get("/calendar")
-def get_calendar_data(station: str = Query("StationA")):
+async def get_calendar_data(station: str = Query("StationA")):
     station = normalize_station(station)
-    calendar_data, calendar_times, public_holidays = get_station_bucket(station)
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(CalendarEntry).where(CalendarEntry.station == station)
+        )).scalars().all()
+
+    calendar_data = {}
+    calendar_times = {}
+    public_holidays = {}
+
+    for r in rows:
+        key = r.date.isoformat()
+        calendar_data[key] = r.status
+        if r.time_label:
+            calendar_times[key] = r.time_label
+        if r.is_public_holiday and r.holiday_name:
+            public_holidays[key] = r.holiday_name
+
     return {
         "station": station,
         "calendar_data": calendar_data,
@@ -103,16 +133,19 @@ async def login(request: Request):
     else:
         return {"success": False, "message": "Invalid credentials"}
 
-# Reset an entire station (guarded)
+# Reset a station
 @app.post("/admin/reset")
-def reset_station(station: str = Query("StationA"), secret: str = Query(...)):
-    station = normalize_station(station)
+async def reset_station(station: str = Query("StationA"), secret: str = Query(...)):  # required
     expected = os.environ.get("RENDER_RESET_SECRET")
     if not expected or secret != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
-    cd, ct, ph = get_station_bucket(station)
-    cd.clear(); ct.clear(); ph.clear()
-    save_data(store)
+
+    station = normalize_station(station)
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(CalendarEntry).where(CalendarEntry.station == station)
+        )
+        await session.commit()
     return {"success": True, "message": f"[{station}] wiped successfully."}
 
 # Add/Update a single date (Working/Holiday) + optional time
@@ -120,126 +153,179 @@ def reset_station(station: str = Query("StationA"), secret: str = Query(...)):
 async def add_calendar_entry(request: Request, station: str = Query("StationA")):
     station = normalize_station(station)
     body = await request.json()
-    date = (body.get("date") or "").strip()
+    d = body.get("date")
     status = body.get("status")
     time = (body.get("time") or "").strip()
 
-    if not DATE_RE.match(date):
-        return {"success": False, "message": "Invalid date format (expected YYYY-MM-DD)"}
     if status not in ["Working", "Holiday"]:
-        return {"success": False, "message": "Invalid status (Working/Holiday)"}
+        return {"success": False, "message": "Invalid status"}
 
-    calendar_data, calendar_times, _ = get_station_bucket(station)
-    calendar_data[date] = status
+    try:
+        date_obj = _date_or_400(d)
+    except HTTPException as e:
+        return {"success": False, "message": e.detail}
 
-    if not time:
-        calendar_times[date] = "0 hours" if status == "Working" else "RD"
-    else:
-        calendar_times[date] = time
+    async with SessionLocal() as session:
+        # find existing entry for that station+date
+        existing = (await session.execute(
+            select(CalendarEntry).where(
+                CalendarEntry.station == station,
+                CalendarEntry.date == date_obj
+            )
+        )).scalars().first()
 
-    save_data(store)
-    return {"success": True, "message": f"[{station}] Added {status} for {date}"}
+        if not existing:
+            existing = CalendarEntry(
+                station=station,
+                date=date_obj,
+                status=status,
+                time_label=None,
+                is_public_holiday=False,
+                holiday_name=None,
+            )
+            session.add(existing)
 
-# --- Public holiday endpoints ---
+        existing.status = status
+        if time:
+            existing.time_label = time
+        else:
+            existing.time_label = "RD" if status == "Holiday" else "0 hours"
 
-# ADD a single public holiday
+        await session.commit()
+    return {"success": True, "message": f"[{station}] Added {status} for {d}"}
+
+# Add a single public holiday
 @app.post("/calendar/public")
 async def add_public_holiday(request: Request, station: str = Query("StationA")):
     station = normalize_station(station)
     body = await request.json()
-    date = (body.get("date") or "").strip()
+    d = (body.get("date") or "").strip()
     name = (body.get("name") or "").strip()
 
-    if not DATE_RE.match(date):
-        return {"success": False, "message": "Invalid date format (expected YYYY-MM-DD)"}
-    if not name:
-        return {"success": False, "message": "Missing holiday name"}
+    if not d or not name:
+        return {"success": False, "message": "Missing date or name"}
 
-    calendar_data, calendar_times, public_holidays = get_station_bucket(station)
-    public_holidays[date] = name
-    calendar_data[date] = "Holiday"
-    calendar_times[date] = "RD"
-    save_data(store)
-    return {"success": True, "message": f"[{station}] Added public holiday {name} on {date}"}
+    try:
+        date_obj = _date_or_400(d)
+    except HTTPException as e:
+        return {"success": False, "message": e.detail}
 
-# LIST public holidays for a month
-@app.get("/calendar/public")
-def list_public_holidays(
-    station: str = Query("StationA"),
-    year: int = Query(...),
-    month: int = Query(...)
-):
-    station = normalize_station(station)
-    _, _, ph = get_station_bucket(station)
-    ym = f"{year:04d}-{month:02d}-"
-    filtered = {d: n for d, n in ph.items() if d.startswith(ym)}
-    return {"station": station, "holidays": filtered}
+    async with SessionLocal() as session:
+        existing = (await session.execute(
+            select(CalendarEntry).where(
+                CalendarEntry.station == station,
+                CalendarEntry.date == date_obj
+            )
+        )).scalars().first()
 
-# REMOVE a single public holiday date
-@app.delete("/calendar/public/{date}")
-def remove_public_holiday(date: str, station: str = Query("StationA")):
-    station = normalize_station(station)
-    if not DATE_RE.match(date):
-        return {"success": False, "message": "Invalid date format (expected YYYY-MM-DD)"}
-    calendar_data, calendar_times, public_holidays = get_station_bucket(station)
+        if not existing:
+            existing = CalendarEntry(
+                station=station,
+                date=date_obj,
+                status="Holiday",
+                time_label="RD",
+                is_public_holiday=True,
+                holiday_name=name,
+            )
+            session.add(existing)
+        else:
+            existing.status = "Holiday"
+            existing.time_label = "RD"
+            existing.is_public_holiday = True
+            existing.holiday_name = name
 
-    if date in public_holidays:
-        del public_holidays[date]
-        calendar_data.pop(date, None)
-        calendar_times.pop(date, None)
-        save_data(store)
-        return {"success": True, "message": f"[{station}] Removed public holiday for {date}"}
-    return {"success": False, "message": "Date not found in public holidays"}
+        await session.commit()
+    return {"success": True, "message": f"[{station}] Added public holiday {name} on {d}"}
 
-# Remove a date (work/holiday/time)
+# Remove a date (work/holiday/time) from a station
 @app.delete("/calendar/{date}")
-def remove_calendar_date(date: str, station: str = Query("StationA")):
+async def remove_calendar_date(date: str, station: str = Query("StationA")):
     station = normalize_station(station)
-    if not DATE_RE.match(date):
-        return {"success": False, "message": "Invalid date format (expected YYYY-MM-DD)"}
-    calendar_data, calendar_times, _ = get_station_bucket(station)
+    try:
+        date_obj = _date_or_400(date)
+    except HTTPException as e:
+        return {"success": False, "message": e.detail}
 
-    removed = False
-    if date in calendar_data:
-        del calendar_data[date]
-        removed = True
-    if date in calendar_times:
-        del calendar_times[date]
-        removed = True
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(CalendarEntry).where(
+                CalendarEntry.station == station,
+                CalendarEntry.date == date_obj
+            )
+        )
+        await session.commit()
+    return {"success": True, "message": f"[{station}] Deleted {date}"}
 
-    if removed:
-        save_data(store)
-        return {"success": True, "message": f"[{station}] Deleted {date}"}
-    return {"success": False, "message": "Date not found"}
-
-# Bulk-load AU (QLD + national) public holidays for a given year
+# Bulk-load AU (QLD) public holidays for a given year into a station
 @app.post("/calendar/public/auto")
 async def fetch_qld_public_holidays(station: str = Query("StationA"), year: int = Query(2025)):
     station = normalize_station(station)
     url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/AU"
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=20)
-            response.raise_for_status()
-            data = response.json()
+            resp = await client.get(url, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
 
-        calendar_data, calendar_times, public_holidays = get_station_bucket(station)
-        count = 0
-        for item in data:
-            counties = item.get("counties") or []
-            # Include QLD-specific and national (no counties). For strictly QLD-only, use: any("QLD" in c for c in counties)
-            if ("QLD" in "".join(counties)) or not counties:
-                date = item["date"]  # YYYY-MM-DD
-                name = item["localName"]
-                public_holidays[date] = name
-                calendar_data[date] = "Holiday"
-                calendar_times[date] = "RD"
-                count += 1
+        added = 0
+        async with SessionLocal() as session:
+            for item in data:
+                counties = item.get("counties") or []
+                # Keep QLD-specific holidays and national holidays (no counties)
+                if ("QLD" in "".join(counties)) or not counties:
+                    d = item["date"]  # YYYY-MM-DD
+                    name = item["localName"]
+                    date_obj = dt.date.fromisoformat(d)
 
-        save_data(store)
-        return {"success": True, "message": f"[{station}] {count} holidays loaded for {year}."}
+                    existing = (await session.execute(
+                        select(CalendarEntry).where(
+                            CalendarEntry.station == station,
+                            CalendarEntry.date == date_obj
+                        )
+                    )).scalars().first()
 
-    except httpx.HTTPError as e:
-        return {"success": False, "error": f"Upstream error: {str(e)}"}
+                    if not existing:
+                        existing = CalendarEntry(
+                            station=station,
+                            date=date_obj,
+                            status="Holiday",
+                            time_label="RD",
+                            is_public_holiday=True,
+                            holiday_name=name,
+                        )
+                        session.add(existing)
+                        added += 1
+                    else:
+                        # Update to holiday
+                        existing.status = "Holiday"
+                        existing.time_label = "RD"
+                        existing.is_public_holiday = True
+                        existing.holiday_name = name
+
+            await session.commit()
+
+        return {"success": True, "message": f"[{station}] {added} holidays loaded for {year}."}
+
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# Remove a single public holiday date from a station
+@app.delete("/calendar/public/{date}")
+async def remove_public_holiday(date: str, station: str = Query("StationA")):
+    station = normalize_station(station)
+    try:
+        date_obj = _date_or_400(date)
+    except HTTPException as e:
+        return {"success": False, "message": e.detail}
+
+    async with SessionLocal() as session:
+        # just set back to non-holiday (or delete entirely—keeping behavior consistent with your previous API)
+        await session.execute(
+            delete(CalendarEntry).where(
+                CalendarEntry.station == station,
+                CalendarEntry.date == date_obj
+            )
+        )
+        await session.commit()
+
+    return {"success": True, "message": f"[{station}] Removed public holiday for {date}"}
